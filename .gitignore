@@ -1,4 +1,4 @@
-node_modules
 .env
+node_modules
 enhanced_messages.json
-enhanced_messages.json
+message_timestamps.json

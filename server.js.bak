@@ -97,61 +97,93 @@ function findLastCommonIndex(
 // merge timeline
 // ========================
 
+
 function mergeMessages(
   timelineMessages,
   kelivoMessages
 ) {
 
-  if (
-    timelineMessages.length === 0
+  // timeline 才是真实时间线
+  let merged = [
+    ...timelineMessages
+  ];
+
+  // append Kelivo 最新消息
+  for (
+    const msg of kelivoMessages
   ) {
 
-    return kelivoMessages;
-  }
-
-  const commonIndex =
-    findLastCommonIndex(
-      timelineMessages,
-      kelivoMessages
-    );
-
-      console.log(
-        "\ncommonIndex =",
-        commonIndex
+    const exists =
+      merged.some(
+        m =>
+          JSON.stringify(m) ===
+          JSON.stringify(msg)
       );
 
-  if (commonIndex === -1) {
+    if (!exists) {
 
-    return [
-      ...timelineMessages,
-      ...kelivoMessages
-    ].slice(-50);
+      merged.push(msg);
+    }
   }
 
-  const extraTimelineMessages =
-    timelineMessages.slice(
-      commonIndex + 1
+  // timeline 里的特殊事件
+  const specialMessages =
+    timelineMessages.filter(
+      msg =>
+        msg.role === "assistant" &&
+        (
+          msg.content.includes(
+            "刚刚给宝宝发了 Bark："
+          ) ||
+          msg.content.includes(
+            "自动唤醒：本次未发送 Bark"
+          )
+        )
     );
 
-  const kelivoNewMessages =
-    kelivoMessages.slice(
-      commonIndex + 1
-    );
+  // 过滤非法 tool messages
+  merged = merged.filter(
+    msg => {
 
-  const merged = [
+      if (
+        msg.role === "tool"
+      ) {
+        return false;
+      }
 
-    ...timelineMessages.slice(
-      0,
-      commonIndex + 1
-    ),
+      if (
+        msg.tool_calls
+      ) {
+        return false;
+      }
 
-    ...extraTimelineMessages,
+      return true;
+    }
+  );
 
-    ...kelivoNewMessages
-  ];
+  // 自动补回特殊事件
+  for (
+    const specialMsg of specialMessages
+  ) {
+
+    const exists =
+      merged.some(
+        m =>
+          JSON.stringify(m) ===
+          JSON.stringify(specialMsg)
+      );
+
+    if (!exists) {
+
+      merged.push(
+        specialMsg
+      );
+    }
+  }
 
   return merged.slice(-50);
 }
+
 
 
 // ========================
@@ -247,24 +279,9 @@ app.post(
       body.messages =
         mergedMessages;
 
-// 读取旧 timeline
-const oldTimeline =
-  loadTimeline();
-
-// merge 历史 + 当前
-const finalTimeline =
-  mergeMessages(
-    oldTimeline,
-    mergedMessages
-  );
-
-// 只保留最后 50 条
-const trimmedTimeline =
-  finalTimeline.slice(-50);
-
-// 保存
+// 保存当前现实镜像
 saveTimeline(
-  trimmedTimeline
+  mergedMessages
 );
 
       console.log(
@@ -293,7 +310,7 @@ saveTimeline(
                 "application/json",
 
               "Authorization":
-                req.headers.authorization || ""
+                `Bearer ${process.env.TARGET_API_KEY}`
             },
 
             body: JSON.stringify(body)

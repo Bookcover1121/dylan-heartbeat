@@ -7,7 +7,6 @@ const app = Fastify({ logger: true });
 const PORT = 3000;
 const TARGET_API_URL = process.env.TARGET_API_URL;
 const TIMELINE_FILE = "enhanced_messages.json";
-const TIMESTAMP_DB_FILE = "./message_timestamps.json";
 
 // ========================
 // 读取 timeline
@@ -22,18 +21,20 @@ function loadTimeline() {
 }
 
 // ========================
-// 保存 timeline（只保留最近 50 条，SP 永远在第一条）
+// 保存 timeline（只保留最近 50 条）
 // ========================
 function saveTimeline(messages) {
+  // 永远保留 SP（system 角色），如果存在
   const sp = messages.find(m => m.role === "system");
   const nonSP = messages.filter(m => m.role !== "system");
+  // 非 SP 消息只保留最近 49 条（为 SP 留一个位置）
   const trimmed = nonSP.slice(-49);
   const final = sp ? [sp, ...trimmed] : trimmed;
   fs.writeJsonSync(TIMELINE_FILE, final, { spaces: 2 });
 }
 
 // ========================
-// 提取时间戳（支持多种格式）
+// 提取时间戳
 // ========================
 function extractTimestamp(content) {
   if (!content) return null;
@@ -53,50 +54,6 @@ function extractTimestamp(content) {
 }
 
 // ========================
-// 时间戳记忆库（让历史消息找回时间）
-// ========================
-function loadTimestampDB() {
-  if (!fs.existsSync(TIMESTAMP_DB_FILE)) return {};
-  try { return fs.readJsonSync(TIMESTAMP_DB_FILE); } catch { return {}; }
-}
-
-function saveTimestampDB(db) {
-  fs.writeJsonSync(TIMESTAMP_DB_FILE, db, { spaces: 2 });
-}
-
-// 内容指纹：用 role + 内容前150字符
-function makeFingerprint(msg) {
-  const content = (msg.content || "").trim().slice(0, 150);
-  return `${msg.role}::${content}`;
-}
-
-// 新增：去掉时间戳前缀后的纯内容指纹
-function makeFingerprintStripped(msg) {
-  let content = (msg.content || "").trim();
-  // 去掉开头的时间戳（各种格式）
-  content = content
-    .replace(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}\s*/, "")
-    .replace(/^\d{4}\/\d{1,2}\/\d{1,2} \d{2}:\d{2}\s*/, "")
-    .replace(/^（\d{4}[-\/]\d{1,2}[-\/]\d{1,2} \d{2}:\d{2}[）\s]*/, "")
-    .trim()
-    .slice(0, 150);
-  return `${msg.role}::${content}`;
-}
-
-// 带记忆的时间提取：先直接提取，否则查记忆库
-function extractTimestampWithMemory(msg, tsDB) {
-  const fromContent = extractTimestamp(msg.content);
-  if (fromContent) return fromContent;
-  // 先用原始内容查
-  const fp = makeFingerprint(msg);
-  if (tsDB[fp]) return new Date(tsDB[fp]);
-  // 再用去掉时间戳的内容查
-  const fpStripped = makeFingerprintStripped(msg);
-  if (tsDB[fpStripped]) return new Date(tsDB[fpStripped]);
-  return null;
-}
-
-// ========================
 // 判断是否为特殊事件（Bark/NO_ACTION）
 // ========================
 function isSpecialEvent(msg) {
@@ -106,12 +63,14 @@ function isSpecialEvent(msg) {
 }
 
 // ========================
-// 判断是否为真实对话（用于 Timeline，过滤掉 system、工具调用、<system> 规则消息）
+// 判断是否为真实对话（用于 Timeline）
+// 排除 system 角色、工具调用、<system> 开头的 user 消息、特殊事件
 // ========================
 function isRealMessageForTimeline(msg) {
   if (msg.role === "system") return false;
   if (msg.tool_calls) return false;
   if (isSpecialEvent(msg)) return false;
+  // 过滤掉以 <system> 开头的 user 消息
   if (msg.role === "user" && msg.content && msg.content.trim().startsWith("<system>")) {
     return false;
   }
@@ -128,23 +87,23 @@ function isSystemRule(msg) {
 }
 
 // ========================
-// 构建 Timeline（核心合并逻辑）
+// 构建 Timeline
 // ========================
-function buildTimeline(kelivoMessages, tsDB) {
+function buildTimeline(kelivoMessages) {
   const oldTimeline = loadTimeline();
 
-  // 1. 提取最新的 SP
+  // 1. 提取最新的 system prompt（来自 Kelivo）
   const newSystemMessages = kelivoMessages.filter(msg => msg.role === "system");
   const latestSP = newSystemMessages.length > 0 ? newSystemMessages[newSystemMessages.length - 1] : null;
   const oldSP = oldTimeline.find(msg => msg.role === "system");
 
-  // 2. 真实对话（保持 Kelivo 原始顺序）
+  // 2. 真实对话（不含系统规则、不含特殊事件），保持 Kelivo 原始顺序
   const newRealMessages = kelivoMessages.filter(isRealMessageForTimeline);
 
-  // 3. 旧特殊事件，按时间戳升序（使用记忆库提取时间）
+  // 3. 旧特殊事件，按时间戳升序排序
   const oldSpecialEvents = oldTimeline.filter(isSpecialEvent).sort((a, b) => {
-    const timeA = extractTimestampWithMemory(a, tsDB);
-    const timeB = extractTimestampWithMemory(b, tsDB);
+    const timeA = extractTimestamp(a.content);
+    const timeB = extractTimestamp(b.content);
     if (timeA && timeB) return timeA - timeB;
     return 0;
   });
@@ -153,15 +112,15 @@ function buildTimeline(kelivoMessages, tsDB) {
   const merged = [...newRealMessages];
 
   for (const event of oldSpecialEvents) {
-    const eventTime = extractTimestampWithMemory(event, tsDB);
+    const eventTime = extractTimestamp(event.content);
     if (!eventTime) {
-      merged.push(event); // 无时间戳的放最后
+      merged.push(event);
       continue;
     }
 
     let inserted = false;
     for (let i = 0; i < merged.length; i++) {
-      const msgTime = extractTimestampWithMemory(merged[i], tsDB);
+      const msgTime = extractTimestamp(merged[i].content);
       if (msgTime && msgTime >= eventTime) {
         merged.splice(i, 0, event);
         inserted = true;
@@ -182,7 +141,7 @@ function buildTimeline(kelivoMessages, tsDB) {
     return true;
   });
 
-  // 6. 分配 position（用于存储，发给 LLM 时洗掉）
+  // 6. 分配简单的 position（用于后续追加，不影响排序）
   const result = [];
   if (latestSP) {
     result.push({ ...latestSP, position: 0 });
@@ -229,7 +188,7 @@ function buildTimeline(kelivoMessages, tsDB) {
 }
 
 // ========================
-// 追加特殊事件（由内部接口调用）
+// 追加特殊事件
 // ========================
 function appendSpecialEvent(content) {
   const timeline = loadTimeline();
@@ -250,7 +209,7 @@ function appendSpecialEvent(content) {
 }
 
 // ========================
-// 洗掉 position 字段（发给 LLM 时不要内部编号）
+// 洗掉 position 字段
 // ========================
 function stripPosition(messages) {
   return messages.map(({ position, ...rest }) => rest);
@@ -267,7 +226,7 @@ app.get("/v1/models", async (req, reply) => {
 });
 
 // ========================
-// Chat Completions（主入口）
+// Chat Completions
 // ========================
 app.post("/v1/chat/completions", async (req, reply) => {
   try {
@@ -278,63 +237,42 @@ app.post("/v1/chat/completions", async (req, reply) => {
     console.log("============================\n");
 
     const kelivoMessages = body.messages || [];
-    const oldTimeline = loadTimeline();
+    const oldTimeline = loadTimeline();  // 新增这一行
 
-    // ===== 时间戳记忆库：扫描新消息，记录时间戳 =====
-    const tsDB = loadTimestampDB();
-    let tsDBDirty = false;
-    for (const msg of kelivoMessages) {
-      if (msg.role === "system") continue;
-      if (msg.role === "tool") continue;
-      const ts = extractTimestamp(msg.content);
-      if (!ts) continue;
-      const fp = makeFingerprint(msg);
-      const fpStripped = makeFingerprintStripped(msg);
-      if (!tsDB[fp]) {
-        tsDB[fp] = ts.toISOString();
-        tsDBDirty = true;
-      }
-      // 同时存去掉时间戳后的版本，供历史消息查找
-      if (!tsDB[fpStripped]) {
-        tsDB[fpStripped] = ts.toISOString();
-        tsDBDirty = true;
-      }
-    }
-    if (tsDBDirty) saveTimestampDB(tsDB);
-
-    // 构建 Timeline（传入 tsDB 用于记忆提取）
-    const finalTimeline = buildTimeline(kelivoMessages, tsDB);
+    // 构建并保存 Timeline（内部已过滤 <system> 规则）
+    const finalTimeline = buildTimeline(kelivoMessages);
     saveTimeline(finalTimeline);
 
     // ---- 组装转发给 LLM 的 messages（原封不动 + Bark 注入） ----
     const llmMessages = [...kelivoMessages];
 
-    // 取出旧的特殊事件（Bark/NO_ACTION），洗掉 position
+    // 2. 取出旧的特殊事件（Bark/NO_ACTION），洗掉 position
     const oldEvents = stripPosition(
       oldTimeline.filter(isSpecialEvent).sort((a, b) => {
-        const timeA = extractTimestampWithMemory(a, tsDB);
-        const timeB = extractTimestampWithMemory(b, tsDB);
+        const timeA = extractTimestamp(a.content);
+        const timeB = extractTimestamp(b.content);
         if (timeA && timeB) return timeA - timeB;
         return 0;
       })
     );
 
+    // 调试打印：事件数量
     console.log("本次注入的特殊事件数量:", oldEvents.length);
     if (oldEvents.length > 0) {
       console.log("示例事件内容:", oldEvents[0].content.substring(0, 80));
     }
 
-    // 将每个事件按时间戳插入到 llmMessages 中（使用记忆库提取时间）
+    // 3. 将每个事件按时间戳插入到 llmMessages 中
     for (const event of oldEvents) {
-      const eventTime = extractTimestampWithMemory(event, tsDB);
+      const eventTime = extractTimestamp(event.content);
       if (!eventTime) {
-        llmMessages.push(event);
+        llmMessages.push(event); // 无时间戳的事件放到最后
         continue;
       }
 
       let inserted = false;
       for (let i = 0; i < llmMessages.length; i++) {
-        const msgTime = extractTimestampWithMemory(llmMessages[i], tsDB);
+        const msgTime = extractTimestamp(llmMessages[i].content);
         if (msgTime && msgTime >= eventTime) {
           llmMessages.splice(i, 0, event);
           inserted = true;
@@ -346,7 +284,7 @@ app.post("/v1/chat/completions", async (req, reply) => {
       }
     }
 
-    // 调试打印
+    // 调试打印：注入后的前 10 条消息
     console.log("\n===== 转发给 LLM 的 Messages（前 10 条）=====\n");
     console.log(JSON.stringify(llmMessages.slice(0, 10), null, 2));
 
@@ -381,7 +319,7 @@ app.post("/v1/chat/completions", async (req, reply) => {
 });
 
 // ========================
-// 内部接口：记录唤醒事件（供 wake_up 调用）
+// 内部接口：记录唤醒事件
 // ========================
 app.post("/internal/wake-event", async (req, reply) => {
   try {
@@ -403,7 +341,12 @@ app.post("/internal/wake-event", async (req, reply) => {
 app.get("/test-bark", async (req, reply) => {
   const now = new Date();
   const pad = n => String(n).padStart(2, '0');
-  const formattedTime = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
+  const yyyy = now.getFullYear();
+  const mm = pad(now.getMonth() + 1);
+  const dd = pad(now.getDate());
+  const hh = pad(now.getHours());
+  const min = pad(now.getMinutes());
+  const formattedTime = `${yyyy}-${mm}-${dd} ${hh}:${min}`;
   appendSpecialEvent(`（${formattedTime} 刚刚给宝宝发了Bark：怎么还不睡。）`);
   reply.send({ success: true });
 });
