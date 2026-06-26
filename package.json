@@ -1,7 +1,7 @@
 {
   "name": "kelivo-gateway",
   "version": "1.0.0",
-  "description": "An AI residency runtime for Kelivo — lets AI proactively reach out, maintain timeline continuity, and truly live with you.",
+  "description": "A local Kelivo gateway that keeps timed chat context and lets your character send optional Bark wake-up messages.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

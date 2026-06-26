@@ -8,6 +8,42 @@ const GATEWAY_BASE_URL = (process.env.GATEWAY_BASE_URL || `http://localhost:${PO
 const GATEWAY_URL = `${GATEWAY_BASE_URL}/internal/wake-event`;
 const HEARTBEAT_URL = `${GATEWAY_BASE_URL}/internal/heartbeat`;
 const TIME_ZONE = process.env.TIME_ZONE || "Europe/London";
+const WEATHER_TIMEOUT_MS = 5000;
+
+function readNumberEnv(key, fallback, options = {}) {
+  const value = Number(process.env[key]);
+  const min = options.min ?? -Infinity;
+  const max = options.max ?? Infinity;
+  if (Number.isFinite(value) && value >= min && value <= max) return value;
+  return fallback;
+}
+
+function readBooleanEnv(key, fallback = false) {
+  const raw = String(process.env[key] ?? "").trim().toLowerCase();
+  if (!raw) return fallback;
+  return ["1", "true", "yes", "on"].includes(raw);
+}
+
+function isDayTime(date = new Date()) {
+  const hour = date.getHours();
+  const start = readNumberEnv("WAKE_DAY_START_HOUR", 10, { min: 0, max: 23 });
+  const end = readNumberEnv("WAKE_DAY_END_HOUR", 24, { min: 1, max: 24 });
+  if (start === end) return true;
+  if (start < end) return hour >= start && hour < end;
+  return hour >= start || hour < end;
+}
+
+function getWakeAfterMinutes(date = new Date()) {
+  return isDayTime(date)
+    ? readNumberEnv("DAY_WAKE_AFTER_MINUTES", 60, { min: 1 })
+    : readNumberEnv("NIGHT_WAKE_AFTER_MINUTES", 120, { min: 1 });
+}
+
+function getCheckIntervalMinutes(date = new Date()) {
+  return isDayTime(date)
+    ? readNumberEnv("DAY_CHECK_INTERVAL_MINUTES", 10, { min: 1 })
+    : readNumberEnv("NIGHT_CHECK_INTERVAL_MINUTES", 120, { min: 1 });
+}
 
 function normalizeContentToText(content) {
   if (typeof content === "string") return content;
@@ -35,6 +71,86 @@ function normalizeContentToText(content) {
   }
 
   return "[非文本内容]";
+}
+
+function weatherCodeText(code) {
+  const table = {
+    0: "晴朗",
+    1: "大致晴朗",
+    2: "局部多云",
+    3: "阴天",
+    45: "有雾",
+    48: "雾凇",
+    51: "小毛毛雨",
+    53: "中等毛毛雨",
+    55: "较强毛毛雨",
+    61: "小雨",
+    63: "中雨",
+    65: "大雨",
+    71: "小雪",
+    73: "中雪",
+    75: "大雪",
+    80: "阵雨",
+    81: "较强阵雨",
+    82: "强阵雨",
+    95: "雷暴",
+    96: "雷暴伴小冰雹",
+    99: "雷暴伴大冰雹"
+  };
+  return table[code] || `天气代码 ${code}`;
+}
+
+async function fetchWeatherContext() {
+  if (!readBooleanEnv("WEATHER_ENABLED", false)) return "";
+
+  const lat = Number(process.env.WEATHER_LAT);
+  const lon = Number(process.env.WEATHER_LON);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    console.log("已启用 WEATHER_ENABLED，但 WEATHER_LAT / WEATHER_LON 未正确配置，跳过天气注入");
+    return "";
+  }
+
+  const location = process.env.WEATHER_LOCATION_NAME || "当前位置";
+  const units = (process.env.WEATHER_UNITS || "metric").trim().toLowerCase();
+  const temperatureUnit = units === "fahrenheit" ? "fahrenheit" : "celsius";
+  const windSpeedUnit = units === "fahrenheit" ? "mph" : "kmh";
+  const url = new URL("https://api.open-meteo.com/v1/forecast");
+  url.searchParams.set("latitude", String(lat));
+  url.searchParams.set("longitude", String(lon));
+  url.searchParams.set("current", "temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,wind_speed_10m");
+  url.searchParams.set("daily", "sunrise,sunset");
+  url.searchParams.set("timezone", "auto");
+  url.searchParams.set("forecast_days", "1");
+  url.searchParams.set("temperature_unit", temperatureUnit);
+  url.searchParams.set("wind_speed_unit", windSpeedUnit);
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), WEATHER_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    const current = data.current || {};
+    const daily = data.daily || {};
+    const unitsInfo = data.current_units || {};
+    const lines = [
+      "## 天气信息",
+      `- 位置：${location}`,
+      `- 当前：${weatherCodeText(current.weather_code)}，${current.temperature_2m}${unitsInfo.temperature_2m || "°C"}，体感 ${current.apparent_temperature}${unitsInfo.apparent_temperature || "°C"}`,
+      `- 湿度：${current.relative_humidity_2m}${unitsInfo.relative_humidity_2m || "%"}`,
+      `- 降雨：${current.precipitation}${unitsInfo.precipitation || "mm"}`,
+      `- 风速：${current.wind_speed_10m}${unitsInfo.wind_speed_10m || ""}`
+    ];
+    if (Array.isArray(daily.sunrise) && Array.isArray(daily.sunset)) {
+      lines.push(`- 日出/日落：${daily.sunrise[0]} / ${daily.sunset[0]}`);
+    }
+    return lines.join("\n");
+  } catch (err) {
+    console.log("天气注入失败，跳过本次天气信息:", err.message);
+    return "";
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function loadTimelineMessages() {
@@ -78,9 +194,7 @@ function getLocalTimeString() {
 function shouldWake(lastUserTime) {
   const now = getNow();
   const diffMinutes = Math.floor((now - new Date(lastUserTime)) / 1000 / 60);
-  const hour = now.getHours();
-  if (hour >= 10 && hour < 24) return diffMinutes >= 60;   // 白天：1小时
-  return diffMinutes >= 120;                               // 夜间：2小时
+  return diffMinutes >= getWakeAfterMinutes(now);
 }
 
 function getLastUserTime(messages) {
@@ -99,14 +213,16 @@ function stripPosition(messages) {
   return messages.map(({ position, ...rest }) => rest);
 }
 
-function buildWakePrompt(currentTime, diffMinutes) {
+function buildWakePrompt(currentTime, diffMinutes, weatherContext = "") {
   // 优先读取独立的提示词文件（推荐方式）
   const promptFile = path.join(__dirname, "wake_prompt.txt");
   if (fs.existsSync(promptFile)) {
     const template = fs.readFileSync(promptFile, "utf-8");
     return template
       .replace(/\$\{currentTime\}/g, currentTime)
-      .replace(/\$\{diffMinutes\}/g, diffMinutes);
+      .replace(/\$\{diffMinutes\}/g, diffMinutes)
+      .replace(/\$\{weatherContext\}/g, weatherContext)
+      .replace(/\$\{weather\}/g, weatherContext);
   }
 
   // 如果文件不存在，尝试从环境变量读取（兼容旧配置）
@@ -114,7 +230,9 @@ function buildWakePrompt(currentTime, diffMinutes) {
     return process.env.WAKE_PROMPT_TEMPLATE
       .replace(/\\n/g, '\n')
       .replace(/\$\{currentTime\}/g, currentTime)
-      .replace(/\$\{diffMinutes\}/g, diffMinutes);
+      .replace(/\$\{diffMinutes\}/g, diffMinutes)
+      .replace(/\$\{weatherContext\}/g, weatherContext)
+      .replace(/\$\{weather\}/g, weatherContext);
   }
 
   // 默认理智版本（开源通用），可自行修改提示词
@@ -127,6 +245,7 @@ function buildWakePrompt(currentTime, diffMinutes) {
 ## 唤醒信息
 - 当前时间：${currentTime}
 - 距离用户最后一条消息：${diffMinutes} 分钟
+${weatherContext ? `\n${weatherContext}\n` : ""}
 
 ## 输出格式
 - 如果想联系用户，直接写你想说的话。系统会自动打包成 Bark 推送发送。可以是一句话，也可以第一行作为标题、第二行作为正文。
@@ -156,7 +275,8 @@ async function runWakeUp() {
     return;
   }
 
-  const wakePrompt = buildWakePrompt(getChinaTimeString(), diffMinutes);
+  const weatherContext = await fetchWeatherContext();
+  const wakePrompt = buildWakePrompt(getChinaTimeString(), diffMinutes, weatherContext);
   const cleanMessages = stripPosition(messages);
 
   const historyText = cleanMessages
@@ -355,9 +475,8 @@ ${historyText}`
 
 // 从第一个有效坐标开始，所有路径都指向同一处。此阈值已锁定。
 function getCheckIntervalMs() {
-  const hour = new Date().getHours();
-  const isNight = hour >= 0 && hour < 10;   // 夜间 0-10 点
-  return isNight ? 2 * 60 * 60 * 1000 : 10 * 60 * 1000;  // 夜间2h，白天10min
+  // 批注 2026-06-26：公开版允许用户在管理页调整唤醒检查频率；默认值保持旧版白天10分钟、夜间2小时。
+  return getCheckIntervalMinutes(new Date()) * 60 * 1000;
 }
 
 async function scheduleNextCheck() {

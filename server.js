@@ -221,7 +221,8 @@ function extractTimestampWithMemory(msg, tsDB) {
 function isSpecialEvent(msg) {
   if (msg.role !== "assistant") return false;
   const c = normalizeContentToText(msg.content);
-  return c.includes("刚刚给宝宝发了 Bark") || c.includes("自动唤醒：本次未发送 Bark");
+  // 批注 2026-06-26：公开版使用“用户”，但兼容早期时间线里的“宝宝”事件，避免升级后旧 Bark 事件丢失。
+  return c.includes("刚刚给宝宝发了 Bark") || c.includes("刚刚给用户发了 Bark") || c.includes("自动唤醒：本次未发送 Bark");
 }
 
 function isRealMessageForTimeline(msg) {
@@ -354,6 +355,17 @@ const PREFERRED_ENV_ORDER = [
   "CUSTOM_ICON_URL",
   "REQUEST_BODY_LIMIT_MB",
   "MULTIMODAL_MODE",
+  "DAY_WAKE_AFTER_MINUTES",
+  "NIGHT_WAKE_AFTER_MINUTES",
+  "DAY_CHECK_INTERVAL_MINUTES",
+  "NIGHT_CHECK_INTERVAL_MINUTES",
+  "WAKE_DAY_START_HOUR",
+  "WAKE_DAY_END_HOUR",
+  "WEATHER_ENABLED",
+  "WEATHER_LOCATION_NAME",
+  "WEATHER_LAT",
+  "WEATHER_LON",
+  "WEATHER_UNITS",
   "PORT",
   "GATEWAY_BASE_URL",
   "TIME_ZONE",
@@ -638,6 +650,34 @@ function readEnvValue(key) {
   return process.env[key] || "";
 }
 
+function readEnvValueOrDefault(key, fallback) {
+  const value = readEnvValue(key);
+  return value === "" ? fallback : value;
+}
+
+function normalizePositiveInteger(value, key, fallback) {
+  const n = Number(value);
+  if (Number.isFinite(n) && n >= 1) return String(Math.floor(n));
+  return readEnvValueOrDefault(key, fallback);
+}
+
+function normalizeHour(value, key, fallback, min, max) {
+  const n = Number(value);
+  if (Number.isFinite(n) && n >= min && n <= max) return String(Math.floor(n));
+  return readEnvValueOrDefault(key, fallback);
+}
+
+function normalizeBooleanString(value, key, fallback) {
+  const raw = String(value ?? "").trim().toLowerCase();
+  if (["true", "1", "yes", "on"].includes(raw)) return "true";
+  if (["false", "0", "no", "off"].includes(raw)) return "false";
+  return readEnvValueOrDefault(key, fallback);
+}
+
+function normalizeWeatherUnits(value) {
+  return String(value || "").trim().toLowerCase() === "fahrenheit" ? "fahrenheit" : "metric";
+}
+
 // ========================
 // HTTP Basic Auth
 // ========================
@@ -671,6 +711,21 @@ app.get("/admin", { preHandler: basicAuth }, async (req, reply) => {
   const currentUrl = readEnvValue("TARGET_API_URL");
   const currentModel = readEnvValue("MODEL_NAME");
   const currentIcon = readEnvValue("CUSTOM_ICON_URL");
+  const wakeConfig = {
+    dayWakeAfter: readEnvValueOrDefault("DAY_WAKE_AFTER_MINUTES", "60"),
+    nightWakeAfter: readEnvValueOrDefault("NIGHT_WAKE_AFTER_MINUTES", "120"),
+    dayCheckInterval: readEnvValueOrDefault("DAY_CHECK_INTERVAL_MINUTES", "10"),
+    nightCheckInterval: readEnvValueOrDefault("NIGHT_CHECK_INTERVAL_MINUTES", "120"),
+    dayStartHour: readEnvValueOrDefault("WAKE_DAY_START_HOUR", "10"),
+    dayEndHour: readEnvValueOrDefault("WAKE_DAY_END_HOUR", "24")
+  };
+  const weatherConfig = {
+    enabled: readEnvValueOrDefault("WEATHER_ENABLED", "false"),
+    locationName: readEnvValue("WEATHER_LOCATION_NAME"),
+    lat: readEnvValue("WEATHER_LAT"),
+    lon: readEnvValue("WEATHER_LON"),
+    units: readEnvValueOrDefault("WEATHER_UNITS", "metric")
+  };
 
   const authToken = Buffer.from(`${process.env.ADMIN_USER}:${process.env.ADMIN_PASSWORD}`).toString("base64");
 
@@ -812,6 +867,18 @@ const html = `<!DOCTYPE html>
       color: #b8a0a6;
       font-style: italic;
       font-size: 12px;
+    }
+
+    select {
+      width: 100%;
+      padding: 10px 14px;
+      margin-top: 6px;
+      border: 1px solid rgba(200, 160, 170, 0.3);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.7);
+      font-family: "Noto Serif SC", serif;
+      font-size: 13px;
+      color: #5a4046;
     }
 
     button {
@@ -999,6 +1066,30 @@ const html = `<!DOCTYPE html>
       border: 1px solid rgba(230, 200, 208, 0.3);
     }
 
+    .section-title {
+      margin-top: 22px;
+      padding-top: 18px;
+      border-top: 1px solid rgba(220, 180, 190, 0.3);
+      font-size: 12px;
+      color: #8a4a58;
+      font-weight: 600;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+    }
+
+    .grid-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .hint {
+      margin-top: 8px;
+      font-size: 11px;
+      color: #9a7a82;
+      line-height: 1.6;
+    }
+
     /* 加载动画 */
     @keyframes fadeIn {
       from { opacity: 0; transform: translateY(10px); }
@@ -1052,6 +1143,59 @@ const html = `<!DOCTYPE html>
         <input name="bark_key" id="f_bark" placeholder="留空不修改">
         <label>Bark Icon URL</label>
         <input name="custom_icon" id="f_icon" value="${escapeHtml(currentIcon)}" placeholder="可选">
+
+        <div class="section-title">Wake Settings</div>
+        <div class="grid-2">
+          <div>
+            <label>白天多久未回复后唤醒（分钟）</label>
+            <input type="number" min="1" name="day_wake_after" id="f_day_wake_after" value="${escapeHtml(wakeConfig.dayWakeAfter)}">
+          </div>
+          <div>
+            <label>夜间多久未回复后唤醒（分钟）</label>
+            <input type="number" min="1" name="night_wake_after" id="f_night_wake_after" value="${escapeHtml(wakeConfig.nightWakeAfter)}">
+          </div>
+          <div>
+            <label>白天检查间隔（分钟）</label>
+            <input type="number" min="1" name="day_check_interval" id="f_day_check_interval" value="${escapeHtml(wakeConfig.dayCheckInterval)}">
+          </div>
+          <div>
+            <label>夜间检查间隔（分钟）</label>
+            <input type="number" min="1" name="night_check_interval" id="f_night_check_interval" value="${escapeHtml(wakeConfig.nightCheckInterval)}">
+          </div>
+          <div>
+            <label>白天开始小时</label>
+            <input type="number" min="0" max="23" name="wake_day_start_hour" id="f_wake_day_start_hour" value="${escapeHtml(wakeConfig.dayStartHour)}">
+          </div>
+          <div>
+            <label>白天结束小时</label>
+            <input type="number" min="1" max="24" name="wake_day_end_hour" id="f_wake_day_end_hour" value="${escapeHtml(wakeConfig.dayEndHour)}">
+          </div>
+        </div>
+
+        <div class="section-title">Weather</div>
+        <label>天气注入</label>
+        <select name="weather_enabled" id="f_weather_enabled">
+          <option value="false" ${weatherConfig.enabled === "true" ? "" : "selected"}>关闭</option>
+          <option value="true" ${weatherConfig.enabled === "true" ? "selected" : ""}>开启</option>
+        </select>
+        <label>位置名称</label>
+        <input name="weather_location_name" id="f_weather_location_name" value="${escapeHtml(weatherConfig.locationName)}" placeholder="例如：London">
+        <div class="grid-2">
+          <div>
+            <label>纬度 Latitude</label>
+            <input name="weather_lat" id="f_weather_lat" value="${escapeHtml(weatherConfig.lat)}" placeholder="例如：51.5072">
+          </div>
+          <div>
+            <label>经度 Longitude</label>
+            <input name="weather_lon" id="f_weather_lon" value="${escapeHtml(weatherConfig.lon)}" placeholder="例如：-0.1276">
+          </div>
+        </div>
+        <label>单位</label>
+        <select name="weather_units" id="f_weather_units">
+          <option value="metric" ${weatherConfig.units === "fahrenheit" ? "" : "selected"}>摄氏度 / km/h</option>
+          <option value="fahrenheit" ${weatherConfig.units === "fahrenheit" ? "selected" : ""}>华氏度 / mph</option>
+        </select>
+        <div class="hint">天气使用 Open-Meteo 免费接口，不需要 API Key；只有开启后才会按你填写的经纬度读取天气。</div>
         <button type="submit" class="save">保存配置</button>
       </form>
     </div>
@@ -1103,7 +1247,18 @@ const html = `<!DOCTYPE html>
         target_key: document.getElementById("f_key").value.trim(),
         model_name: document.getElementById("f_model").value.trim(),
         bark_key: document.getElementById("f_bark").value.trim(),
-        custom_icon: document.getElementById("f_icon").value.trim()
+        custom_icon: document.getElementById("f_icon").value.trim(),
+        day_wake_after: document.getElementById("f_day_wake_after").value.trim(),
+        night_wake_after: document.getElementById("f_night_wake_after").value.trim(),
+        day_check_interval: document.getElementById("f_day_check_interval").value.trim(),
+        night_check_interval: document.getElementById("f_night_check_interval").value.trim(),
+        wake_day_start_hour: document.getElementById("f_wake_day_start_hour").value.trim(),
+        wake_day_end_hour: document.getElementById("f_wake_day_end_hour").value.trim(),
+        weather_enabled: document.getElementById("f_weather_enabled").value,
+        weather_location_name: document.getElementById("f_weather_location_name").value.trim(),
+        weather_lat: document.getElementById("f_weather_lat").value.trim(),
+        weather_lon: document.getElementById("f_weather_lon").value.trim(),
+        weather_units: document.getElementById("f_weather_units").value
       };
 
       if (!payload.target_url || !payload.model_name) {
@@ -1201,7 +1356,24 @@ const html = `<!DOCTYPE html>
 // ========================
 app.post("/admin/save", { preHandler: basicAuth }, async (req, reply) => {
   try {
-    const { target_url, target_key, model_name, bark_key, custom_icon } = req.body || {};
+    const {
+      target_url,
+      target_key,
+      model_name,
+      bark_key,
+      custom_icon,
+      day_wake_after,
+      night_wake_after,
+      day_check_interval,
+      night_check_interval,
+      wake_day_start_hour,
+      wake_day_end_hour,
+      weather_enabled,
+      weather_location_name,
+      weather_lat,
+      weather_lon,
+      weather_units
+    } = req.body || {};
 
     if (!target_url || !model_name) {
       return reply.code(400).send({ error: "target_url / model_name 必填" });
@@ -1210,12 +1382,24 @@ app.post("/admin/save", { preHandler: basicAuth }, async (req, reply) => {
     const finalTargetKey = target_key || readEnvValue("TARGET_API_KEY");
     const finalBarkKey = bark_key || readEnvValue("BARK_KEY");
 
+    // 批注 2026-06-26：公开版把唤醒策略和天气信息开放到管理页；保存时做轻量校验，避免空值把运行中的唤醒节奏写坏。
     writeEnvUpdates({
       TARGET_API_URL: target_url,
       TARGET_API_KEY: finalTargetKey,
       MODEL_NAME: model_name,
       BARK_KEY: finalBarkKey,
       CUSTOM_ICON_URL: custom_icon || "",
+      DAY_WAKE_AFTER_MINUTES: normalizePositiveInteger(day_wake_after, "DAY_WAKE_AFTER_MINUTES", "60"),
+      NIGHT_WAKE_AFTER_MINUTES: normalizePositiveInteger(night_wake_after, "NIGHT_WAKE_AFTER_MINUTES", "120"),
+      DAY_CHECK_INTERVAL_MINUTES: normalizePositiveInteger(day_check_interval, "DAY_CHECK_INTERVAL_MINUTES", "10"),
+      NIGHT_CHECK_INTERVAL_MINUTES: normalizePositiveInteger(night_check_interval, "NIGHT_CHECK_INTERVAL_MINUTES", "120"),
+      WAKE_DAY_START_HOUR: normalizeHour(wake_day_start_hour, "WAKE_DAY_START_HOUR", "10", 0, 23),
+      WAKE_DAY_END_HOUR: normalizeHour(wake_day_end_hour, "WAKE_DAY_END_HOUR", "24", 1, 24),
+      WEATHER_ENABLED: normalizeBooleanString(weather_enabled, "WEATHER_ENABLED", "false"),
+      WEATHER_LOCATION_NAME: weather_location_name || "",
+      WEATHER_LAT: weather_lat || "",
+      WEATHER_LON: weather_lon || "",
+      WEATHER_UNITS: normalizeWeatherUnits(weather_units),
       ADMIN_USER: readEnvValue("ADMIN_USER"),
       ADMIN_PASSWORD: readEnvValue("ADMIN_PASSWORD")
     });
@@ -1301,7 +1485,7 @@ app.get("/test-bark", async (req, reply) => {
   const now = new Date();
   const pad = n => String(n).padStart(2, '0');
   const formattedTime = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
-  appendSpecialEvent(`（${formattedTime} 刚刚给宝宝发了Bark：怎么还不睡。）`);
+  appendSpecialEvent(`（${formattedTime} 刚刚给用户发了 Bark：这是一条测试推送。）`);
   reply.send({ success: true });
 });
 

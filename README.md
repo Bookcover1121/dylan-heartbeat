@@ -1,11 +1,13 @@
 # Dylan Heartbeat — AI Residency Runtime for Kelivo
 
-**一个基于 Kelivo 的 AI Agent 运行时。**  
-它不是“聊天接口转发器”，而是一个让 AI 真正**长期居住**的数字环境。
+**一个给 Kelivo 角色使用的本地常驻小服务。**  
+它会接住 Kelivo 发给模型的请求，帮角色保留带时间顺序的聊天现场，并在你很久没有回复时，让角色可以自己判断要不要发一条 Bark 推送。
 
 > 使用方式是先 [Fork 本项目](https://github.com/callie0313/dylan-heartbeat/fork)，再 clone 你自己的 fork 进行配置和部署。
 >
 > Dylan Heartbeat 会写入 `.env`、时间线、预设和个性化提示词；Fork 后使用能保留你的个人改动，也方便后续同步上游更新。直接 clone 原仓库也许能跑，但后续改配置、同步更新和部署都会更麻烦，本文档不再提供直接 clone 原仓库的流程。
+>
+> 如果你已经 Fork 或部署过旧版本，新功能不会自动进入你的部署目录。请重新 Fork，或在自己的 fork 中同步上游更新后再重新部署。
 
 ---
 
@@ -73,6 +75,13 @@ Bark 推送 → 你的手机
 - 🛠️ 修复跨平台部署问题：一键重启默认只重启 `gateway` 和 `wake-up`，并声明 Node.js `>=20`。
 - 🍴 强化 Fork-first 使用流程，并修正包元数据中的许可证声明。
 
+## 📋 更新日志（2026-06-26）
+
+- ⏱️ 自动唤醒策略可配置：可在管理页填写白天/夜间唤醒阈值、检查间隔和白天时段。
+- 🌦️ 新增可选天气注入：使用 Open-Meteo 免费接口，不需要 API Key；默认关闭，用户自行填写位置后启用。
+- 🖥️ 管理页新增 Wake Settings / Weather 配置区，保存后写入 `.env`，重启后生效。
+- 🍴 说明已有 fork/部署不会自动更新；需要重新 Fork 或同步上游后重新部署。
+
 ---
 
 ## 🚀 快速开始
@@ -121,6 +130,17 @@ BARK_KEY=你的Bark设备Key
 CUSTOM_ICON_URL=https://你的图标URL（可选）
 REQUEST_BODY_LIMIT_MB=50
 MULTIMODAL_MODE=text
+DAY_WAKE_AFTER_MINUTES=60
+NIGHT_WAKE_AFTER_MINUTES=120
+DAY_CHECK_INTERVAL_MINUTES=10
+NIGHT_CHECK_INTERVAL_MINUTES=120
+WAKE_DAY_START_HOUR=10
+WAKE_DAY_END_HOUR=24
+WEATHER_ENABLED=false
+WEATHER_LOCATION_NAME=London
+WEATHER_LAT=
+WEATHER_LON=
+WEATHER_UNITS=metric
 PORT=3000
 GATEWAY_BASE_URL=http://localhost:3000
 TIME_ZONE=Europe/London
@@ -203,10 +223,60 @@ RESTART_COMMAND=pm2 restart 你的gateway进程名 你的wake进程名
 
 ## ⏱️ 自动唤醒策略
 
-- **白天（10:00–00:00）**：距离最后一条用户消息 **60 分钟**自动唤醒
-- **夜间（00:00–10:00）**：间隔放宽为 **120 分钟**
-- 检查频率：白天每 10 分钟，夜间每 2 小时（可在 `wake_up.js` 中调整）
+- **白天默认（10:00–24:00）**：距离最后一条用户消息 **60 分钟**自动唤醒
+- **夜间默认（00:00–10:00）**：间隔放宽为 **120 分钟**
+- 检查频率默认：白天每 10 分钟，夜间每 2 小时
 - 若用户一直未回复，后续会继续唤醒
+
+这些数值现在可以在 `/admin` 管理页的 **Wake Settings** 区域直接填写，保存后写入 `.env`，重启 `gateway` 和 `wake-up` 后生效。
+
+对应环境变量：
+
+```env
+DAY_WAKE_AFTER_MINUTES=60
+NIGHT_WAKE_AFTER_MINUTES=120
+DAY_CHECK_INTERVAL_MINUTES=10
+NIGHT_CHECK_INTERVAL_MINUTES=120
+WAKE_DAY_START_HOUR=10
+WAKE_DAY_END_HOUR=24
+```
+
+说明：
+
+- `DAY_WAKE_AFTER_MINUTES` / `NIGHT_WAKE_AFTER_MINUTES`：距离最后一条用户消息多久后允许唤醒。
+- `DAY_CHECK_INTERVAL_MINUTES` / `NIGHT_CHECK_INTERVAL_MINUTES`：后台多久检查一次是否应该唤醒。
+- `WAKE_DAY_START_HOUR` / `WAKE_DAY_END_HOUR`：哪一段时间算“白天”；不在白天范围内就按夜间策略处理。
+
+## 🌦️ 天气注入
+
+Dylan Heartbeat 可以在自动唤醒时，把当前天气作为一小段背景信息交给模型。天气使用 [Open-Meteo](https://open-meteo.com/) 免费接口，不需要 API Key。
+
+默认关闭：
+
+```env
+WEATHER_ENABLED=false
+```
+
+开启时，在 `/admin` 管理页的 **Weather** 区域填写：
+
+```env
+WEATHER_ENABLED=true
+WEATHER_LOCATION_NAME=London
+WEATHER_LAT=51.5072
+WEATHER_LON=-0.1276
+WEATHER_UNITS=metric
+```
+
+怎么设置自己的位置：
+
+1. 打开 Google Maps、Apple Maps 或任意地图网站。
+2. 搜索你的城市或你想让 AI 感知的地点。
+3. 复制该地点的纬度和经度，填入 `WEATHER_LAT` 和 `WEATHER_LON`。
+4. `WEATHER_LOCATION_NAME` 只是给模型看的名称，可以写城市名、学校名、家附近区域名。
+
+如果不想暴露精确位置，可以只填城市中心点坐标。例如人在伦敦，可以填 London 的公共坐标，而不是住址坐标。
+
+天气信息会注入到唤醒 prompt 中，内容包括：天气概况、温度、体感温度、湿度、降雨、风速、日出日落。自定义 `wake_prompt.txt` 时，可以使用 `${weatherContext}` 或 `${weather}` 占位符控制注入位置。
 
 ---
 
